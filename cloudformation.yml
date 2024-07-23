@@ -1,0 +1,112 @@
+
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  CloudTrailLogGroup:
+    Type: String
+    Description: "The CloudWatch log group where CloudTrail writes the logs"
+Resources:
+  User:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+      - PolicyName: allow-s3
+        PolicyDocument:
+           Version: 2012-10-17
+           Statement:
+              - Effect: Allow
+                Action:
+                 - 's3:*'
+                Resource: '*'
+  LambdaLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      RetentionInDays: 365
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: allow-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - 'logs:PutLogEvents'
+              - 'logs:CreateLogStream'
+              Resource: !Sub "${LambdaLogGroup.Arn}:*"
+            - Effect: Allow
+              Action:
+              - 'iam:AttachUserPolicy'
+              Resource: !GetAtt User.Arn
+              Condition:
+                StringEquals:
+                  "iam:PolicyARN": "arn:aws:iam::aws:policy/AWSDenyAll"
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs20.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      ReservedConcurrentExecutions: 1
+      Timeout: 30
+      Code:
+        ZipFile: |
+          const {IAMClient, AttachUserPolicyCommand} = require("@aws-sdk/client-iam");
+          exports.handler = async (event) => {
+            const res = await new IAMClient().send(new AttachUserPolicyCommand({
+              UserName: process.env.UserName,
+              PolicyArn: "arn:aws:iam::aws:policy/AWSDenyAll",
+            }));
+            console.log(res);
+          };
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          UserName: !Ref User
+  LoginMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref CloudTrailLogGroup
+      FilterPattern: !Sub '{$.errorCode = "AccessDenied" && $.userIdentity.arn = "${User.Arn}"}'
+      MetricTransformations:
+      - MetricValue: 1
+        MetricNamespace: !Sub "${AWS::StackName}"
+        MetricName: !Sub "AccessDenieds-${User}"
+  AccessDeniedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Threshold: 0
+      Namespace: !Sub "${AWS::StackName}"
+      MetricName: !Sub "AccessDenieds-${User}"
+      Statistic: Maximum
+      Period: 60
+      TreatMissingData: notBreaching
+      ActionsEnabled: true
+      AlarmActions:
+      - !GetAtt LambdaFunction.Arn
+  InvokeLambdaPermission: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "lambda.alarms.cloudwatch.amazonaws.com"
+      SourceArn: !GetAtt AccessDeniedAlarm.Arn
+Outputs:
+  LogsURL:
+    Value: !Sub
+    - "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#logsV2:log-groups/log-group/${CloudTrailLogGroupEscaped}/log-events/$3FfilterPattern$3D$257B$2524.errorCode+$253D+$2522AccessDenied$2522+$2526$2526+$2528$2524.userIdentity.type+$2521$253D+$2522AWSAccount$2522+$257C$257C+$2524.userIdentity.principalId+$2521$253D+$2522$2522$2529$257D"
+    - CloudTrailLogGroupEscaped: !Join [ '$252F', !Split [ '/', !Ref CloudTrailLogGroup ] ]
+
